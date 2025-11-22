@@ -21,6 +21,14 @@ TG_BOT_TOKEN="${TG_BOT_TOKEN:-}"
 TG_CHAT_ID="${TG_CHAT_ID:-}"
 INSTANCE_NAME="${INSTANCE_NAME:-VPN}"
 
+# SOCKS 检测相关（按你要求默认：10 秒 + 只记录失败）
+SOCKS_CHECK_INTERVAL="${SOCKS_CHECK_INTERVAL:-10}"      # 连通性检测间隔（秒）
+LOG_ONLY_ERRORS="${LOG_ONLY_ERRORS:-true}"             # 默认只在失败时写检测日志
+MONITOR_SUCCESS_EVERY_N="${MONITOR_SUCCESS_EVERY_N:-0}"# 成功节流：>0 表示每 N 次成功打一次，0=永不
+
+# danted 日志路径（用于恢复时一起清理）
+DANTED_LOG_FILE="${DANTED_LOG_FILE:-/var/log/danted.log}"
+
 # ===== 运行时变量 =====
 RECOVERY_LOCK=false
 CURRENT_SOCKS_PID=0
@@ -34,7 +42,7 @@ check_log_size() {
   local size
   size=$(wc -c <"$LOG_FILE" 2>/dev/null || echo 0)
   if [ "$size" -ge "$max_bytes" ]; then
-    : > "$LOG_FILE"   # 保持 inode，不打断 openvpn/danted 的文件描述符
+    : > "$LOG_FILE"   # 保持 inode，不打断 openvpn 的文件描述符
     echo "$(date '+%Y-%m-%d %H:%M:%S') - [日志轮转] $LOG_FILE 超过 ${LOG_MAX_SIZE_MB}MB，已就地清空" >> "$LOG_FILE"
   fi
 }
@@ -49,7 +57,10 @@ log() {
 clear_log() {
   log "[清理] 准备清理日志文件..."
   : > "$LOG_FILE"
-  log "[清理] 日志文件已清空"
+  if [ -n "$DANTED_LOG_FILE" ] && [ -f "$DANTED_LOG_FILE" ]; then
+    : > "$DANTED_LOG_FILE"
+  fi
+  log "[清理] OpenVPN 日志和 danted 日志已清空"
 }
 
 send_telegram_message() {
@@ -75,7 +86,7 @@ send_telegram_message() {
   fi
 }
 
-# ----- 初始化主配置失败计数（防空/防非数字） -----
+# ----- 初始化主配置失败计数 -----
 if [ -f "$FAIL_COUNT_FILE" ]; then
   PRIMARY_FAIL_COUNT=$(cat "$FAIL_COUNT_FILE" 2>/dev/null)
   if ! [[ "$PRIMARY_FAIL_COUNT" =~ ^[0-9]+$ ]]; then
@@ -89,7 +100,7 @@ else
   log "[配置切换] 初始化主配置失败次数: 0"
 fi
 
-# ----- 下载配置：优先序可变，但“一轮内必试两端”，并正确维护计数 -----
+# ----- 下载配置：主/备都尝试，备用失败时会回退主，主成功清 0 计数 -----
 download_config() {
   local sources=()
   local labels=()
@@ -116,7 +127,6 @@ download_config() {
            grep -q "dev tun" "$CONFIG_FILE.tmp" && \
            grep -q "remote " "$CONFIG_FILE.tmp"; then
 
-          # 兼容旧 cipher 警告
           sed -i '/^cipher AES-128-CBC$/d' "$CONFIG_FILE.tmp"
           echo "data-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC" >> "$CONFIG_FILE.tmp"
           echo "data-ciphers-fallback AES-128-CBC" >> "$CONFIG_FILE.tmp"
@@ -146,12 +156,10 @@ download_config() {
       sleep "$CONFIG_RETRY_INTERVAL"
     done
 
-    # 当前来源成功则直接返回
     if [ $ok_any -eq 1 ]; then
       return 0
     fi
 
-    # 只有“整轮尝试主来源失败”才 +1（多次重试只算一次）
     if [ "$label" = "主" ]; then
       PRIMARY_FAIL_COUNT=$((PRIMARY_FAIL_COUNT + 1))
       echo "$PRIMARY_FAIL_COUNT" > "$FAIL_COUNT_FILE"
@@ -186,8 +194,8 @@ start_socks() {
     return 0
   fi
   log "[SOCKS] 启动中..."
-  # danted 独立日志，避免污染 openvpn.log（建议 danted.conf 使用 logoutput: stderr）
-  /usr/sbin/danted -f /etc/danted.conf > /var/log/danted.log 2>&1 &
+  # 建议 danted.conf 使用 logoutput: stderr，这里才能完整收集
+  /usr/sbin/danted -f /etc/danted.conf > "$DANTED_LOG_FILE" 2>&1 &
   CURRENT_SOCKS_PID=$!
   sleep 2
   if kill -0 "$CURRENT_SOCKS_PID" 2>/dev/null; then
@@ -243,7 +251,7 @@ start_vpn() {
 }
 
 monitor_socks() {
-  log "[SOCKS监控] 启动监控 (10秒间隔)"
+  log "[SOCKS监控] 启动监控 (${SOCKS_CHECK_INTERVAL}秒间隔)"
   log "[SOCKS监控] 尝试获取初始IP..."
   local initial_ip
   initial_ip=$(curl -sSf --connect-timeout 10 --max-time 15 --location --fail \
@@ -257,13 +265,12 @@ monitor_socks() {
     log "[SOCKS监控] 返回内容: $initial_ip"
   fi
 
-  local socks_check_interval=10
   local socks_fail_count=0
   local max_fail_count=3
   local total_checks=0
+  local success_count=0
   local test_urls=("https://www.gstatic.com/generate_204" "https://www.wikipedia.org" "https://www.cloudflare.com")
   local url_index=0
-  log "[SOCKS监控] 开始轮询连通性测试"
 
   while true; do
     if ! kill -0 "$VPN_PID" 2>/dev/null; then
@@ -275,30 +282,34 @@ monitor_socks() {
     url_index=$((total_checks % 3))
     local current_url=${test_urls[$url_index]}
 
-    log "[SOCKS检测] 测试#${total_checks} (目标: $current_url)..."
-
     if timeout 25s curl --silent --show-error --fail \
         --connect-timeout 10 --max-time 15 --location \
         --socks5-hostname 127.0.0.1:1080 "$current_url" \
-        --head \
-        --http1.1 \
-        --tls-max 1.2 \
-        >/dev/null 2>&1; then
-      log "[SOCKS检测] 连通性正常 - 目标: $current_url"
+        --head --http1.1 --tls-max 1.2 >/dev/null 2>&1; then
       socks_fail_count=0
+      success_count=$((success_count + 1))
+      if [ "$LOG_ONLY_ERRORS" != "true" ]; then
+        if [ "$MONITOR_SUCCESS_EVERY_N" -gt 0 ]; then
+          if [ $((success_count % MONITOR_SUCCESS_EVERY_N)) -eq 0 ]; then
+            log "[SOCKS检测] 连通性正常 - 目标: $current_url (累计OK: $success_count)"
+          fi
+        else
+          log "[SOCKS检测] 连通性正常 - 目标: $current_url"
+        fi
+      fi
     else
       socks_fail_count=$((socks_fail_count + 1))
       local curl_error
       curl_error=$(timeout 25s curl -I -v --socks5-hostname 127.0.0.1:1080 "$current_url" \
           --http1.1 --tls-max 1.2 2>&1 | grep -E 'Failed|error|SSL|timeout|HTTP/[12]\.[01] [45][0-9][0-9]' | tail -n 3 || true)
-      log "[SOCKS检测] 失败 (累计:${socks_fail_count}/${max_fail_count}) 错误: ${curl_error:-无详情}"
+      log "[SOCKS检测] 失败 (累计:${socks_fail_count}/${max_fail_count}) 目标: $current_url 错误: ${curl_error:-无详情}"
       if [ "$socks_fail_count" -ge "$max_fail_count" ]; then
         log "[SOCKS监控] 达到失败阈值 (连续失败 $max_fail_count 次)"
         return 1
       fi
     fi
 
-    sleep "$socks_check_interval"
+    sleep "$SOCKS_CHECK_INTERVAL"
   done
 }
 
@@ -347,6 +358,7 @@ log "主配置URL: $PRIMARY_CONFIG_URL"
 log "备用配置URL: $BACKUP_CONFIG_URL"
 log "检测间隔: $CHECK_INTERVAL 秒"
 log "日志轮转阈值: ${LOG_MAX_SIZE_MB} MB"
+log "SOCKS 检测间隔: ${SOCKS_CHECK_INTERVAL} 秒，LOG_ONLY_ERRORS=${LOG_ONLY_ERRORS}"
 
 while ! download_config; do
   sleep "$CONFIG_RETRY_INTERVAL"
