@@ -1,9 +1,11 @@
 #!/bin/bash
 set -o pipefail
 
+# ===== 必填环境变量 =====
 PRIMARY_CONFIG_URL="${PRIMARY_CONFIG_URL:?环境变量 PRIMARY_CONFIG_URL 未设置}"
 BACKUP_CONFIG_URL="${BACKUP_CONFIG_URL:?环境变量 BACKUP_CONFIG_URL 未设置}"
 
+# ===== 可选环境变量（有默认值）=====
 CONFIG_FILE="${CONFIG_FILE:-/etc/openvpn/client/client.ovpn}"
 LOG_FILE="${LOG_FILE:-/var/log/openvpn.log}"
 FAIL_COUNT_FILE="${FAIL_COUNT_FILE:-/var/log/openvpnsb.log}"
@@ -17,12 +19,14 @@ LOG_MAX_SIZE_MB="${LOG_MAX_SIZE_MB:-10}"
 
 TG_BOT_TOKEN="${TG_BOT_TOKEN:-}"
 TG_CHAT_ID="${TG_CHAT_ID:-}"
+INSTANCE_NAME="${INSTANCE_NAME:-VPN}"
 
+# ===== 运行时变量 =====
 RECOVERY_LOCK=false
 CURRENT_SOCKS_PID=0
 VPN_PID=""
 
-# ===== 关键修复：日志轮转“就地清空”，不要 mv =====
+# ----- 日志轮转：就地清空（copytruncate），避免 mv 造成 FD 断裂 -----
 check_log_size() {
   [ -z "$LOG_FILE" ] && return 0
   [ ! -f "$LOG_FILE" ] && return 0
@@ -30,7 +34,7 @@ check_log_size() {
   local size
   size=$(wc -c <"$LOG_FILE" 2>/dev/null || echo 0)
   if [ "$size" -ge "$max_bytes" ]; then
-    : > "$LOG_FILE"   # 保持 inode，不会断开 openvpn/danted 的 FD
+    : > "$LOG_FILE"   # 保持 inode，不打断 openvpn/danted 的文件描述符
     echo "$(date '+%Y-%m-%d %H:%M:%S') - [日志轮转] $LOG_FILE 超过 ${LOG_MAX_SIZE_MB}MB，已就地清空" >> "$LOG_FILE"
   fi
 }
@@ -54,28 +58,24 @@ send_telegram_message() {
     log "[Telegram] 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，跳过发送"
     return 0
   fi
-  local bot_token="$TG_BOT_TOKEN"
-  local chat_id="$TG_CHAT_ID"
-  local send_url="https://api.telegram.org/bot${bot_token}/sendMessage"
+  local send_url="https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage"
   local short_message
   short_message=$(echo "$message" | head -n 2)
   log "[Telegram] 尝试发送新消息..."
   local send_response
   send_response=$(curl -s -X POST "$send_url" \
-      -d chat_id="$chat_id" \
-      -d text="${INSTANCE_NAME:-VPN} 当前IP:%0A$short_message" \
-      --http1.1 \
-      --tls-max 1.2 \
-      --connect-timeout 5 --max-time 10 2>/dev/null)
+      -d chat_id="$TG_CHAT_ID" \
+      -d text="${INSTANCE_NAME} 当前IP:%0A$short_message" \
+      --http1.1 --tls-max 1.2 --connect-timeout 5 --max-time 10 2>/dev/null)
   local send_status=$?
   if [ $send_status -eq 0 ] && [ -n "$send_response" ]; then
     log "[Telegram] 消息已成功发送"
   else
-    log "[Telegram] 错误：消息发送失败，curl 调用失败 (状态码: $send_status, 响应: $send_response)"
+    log "[Telegram] 错误：消息发送失败 (状态码: $send_status, 响应: $send_response)"
   fi
 }
 
-# 失败次数初始化（容错：空/非数字 => 0）
+# ----- 初始化主配置失败计数（防空/防非数字） -----
 if [ -f "$FAIL_COUNT_FILE" ]; then
   PRIMARY_FAIL_COUNT=$(cat "$FAIL_COUNT_FILE" 2>/dev/null)
   if ! [[ "$PRIMARY_FAIL_COUNT" =~ ^[0-9]+$ ]]; then
@@ -89,70 +89,34 @@ else
   log "[配置切换] 初始化主配置失败次数: 0"
 fi
 
+# ----- 下载配置：优先序可变，但“一轮内必试两端”，并正确维护计数 -----
 download_config() {
-  local retry_count=0
-  local use_backup=false
-  local config_url
+  local sources=()
+  local labels=()
 
   if [ "$PRIMARY_FAIL_COUNT" -ge "$PRIMARY_FAIL_THRESHOLD" ]; then
-    use_backup=true
-    log "[配置切换] 主配置失败次数已达阈值($PRIMARY_FAIL_COUNT)，本次使用备用配置"
+    log "[配置切换] 主配置失败次数已达阈值($PRIMARY_FAIL_COUNT)，本次优先尝试备用配置"
+    sources=("$BACKUP_CONFIG_URL" "$PRIMARY_CONFIG_URL")
+    labels=("备" "主")
+  else
+    sources=("$PRIMARY_CONFIG_URL" "$BACKUP_CONFIG_URL")
+    labels=("主" "备")
   fi
 
-  while [ $retry_count -lt "$MAX_RETRIES" ]; do
-    if $use_backup; then
-      config_url="$BACKUP_CONFIG_URL"
-      log "[配置更新] 尝试从备用配置下载 (第 $((retry_count+1))/$MAX_RETRIES 次)"
-    else
-      config_url="$PRIMARY_CONFIG_URL"
-      log "[配置更新] 尝试从主配置下载 (第 $((retry_count+1))/$MAX_RETRIES 次)"
-    fi
+  local i src label retry ok_any=0
+  for i in 0 1; do
+    src="${sources[$i]}"
+    label="${labels[$i]}"
+    retry=0
 
-    if curl -sSf --connect-timeout 20 --max-time 30 "$config_url" -o "$CONFIG_FILE.tmp"; then
-      if grep -q "client" "$CONFIG_FILE.tmp" && \
-         grep -q "dev tun" "$CONFIG_FILE.tmp" && \
-         grep -q "remote " "$CONFIG_FILE.tmp"; then
-
-        sed -i '/^cipher AES-128-CBC$/d' "$CONFIG_FILE.tmp"
-        echo "data-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC" >> "$CONFIG_FILE.tmp"
-        echo "data-ciphers-fallback AES-128-CBC" >> "$CONFIG_FILE.tmp"
-
-        mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-        chmod 600 "$CONFIG_FILE"
-
-        if ! $use_backup; then
-          PRIMARY_FAIL_COUNT=0
-          echo "0" > "$FAIL_COUNT_FILE"
-          log "[配置切换] 主配置下载成功，失败次数重置为0"
-        fi
-
-        log "[配置更新] 下载验证成功 (来源: $config_url)"
-        return 0
-      else
-        log "[配置更新] 错误：配置缺少必要字段"
-        rm -f "$CONFIG_FILE.tmp"
-      fi
-    else
-      log "[配置更新] 错误：从 $config_url 下载失败"
-      rm -f "$CONFIG_FILE.tmp"
-    fi
-
-    retry_count=$((retry_count + 1))
-    sleep "$CONFIG_RETRY_INTERVAL"
-  done
-
-  if ! $use_backup; then
-    PRIMARY_FAIL_COUNT=$((PRIMARY_FAIL_COUNT + 1))
-    echo "$PRIMARY_FAIL_COUNT" > "$FAIL_COUNT_FILE"
-    log "[配置切换] 主配置下载失败，失败次数增加至$PRIMARY_FAIL_COUNT"
-
-    if [ "$PRIMARY_FAIL_COUNT" -ge "$PRIMARY_FAIL_THRESHOLD" ]; then
-      log "[配置切换] 主配置失败次数已达阈值($PRIMARY_FAIL_COUNT)，将切换到备用配置"
-      if curl -sSf --connect-timeout 20 --max-time 30 "$BACKUP_CONFIG_URL" -o "$CONFIG_FILE.tmp"; then
+    while [ $retry -lt "$MAX_RETRIES" ]; do
+      log "[配置更新] 尝试从${label}配置下载 (第 $((retry+1))/$MAX_RETRIES 次)"
+      if curl -sSf --connect-timeout 20 --max-time 30 "$src" -o "$CONFIG_FILE.tmp"; then
         if grep -q "client" "$CONFIG_FILE.tmp" && \
            grep -q "dev tun" "$CONFIG_FILE.tmp" && \
            grep -q "remote " "$CONFIG_FILE.tmp"; then
 
+          # 兼容旧 cipher 警告
           sed -i '/^cipher AES-128-CBC$/d' "$CONFIG_FILE.tmp"
           echo "data-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC" >> "$CONFIG_FILE.tmp"
           echo "data-ciphers-fallback AES-128-CBC" >> "$CONFIG_FILE.tmp"
@@ -160,22 +124,42 @@ download_config() {
           mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
           chmod 600 "$CONFIG_FILE"
 
-          log "[配置更新] 备用配置下载成功"
-          return 0
+          if [ "$label" = "主" ]; then
+            PRIMARY_FAIL_COUNT=0
+            echo "0" > "$FAIL_COUNT_FILE"
+            log "[配置切换] 主配置下载成功，失败次数重置为0"
+          fi
+
+          log "[配置更新] 下载验证成功 (来源: ${label}配置: $src)"
+          ok_any=1
+          break
         else
-          log "[配置更新] 错误：备用配置缺少必要字段"
+          log "[配置更新] 错误：${label}配置缺少必要字段"
           rm -f "$CONFIG_FILE.tmp"
-          return 1
         fi
       else
-        log "[配置更新] 错误：备用配置下载失败"
+        log "[配置更新] 错误：从${label}配置下载失败"
         rm -f "$CONFIG_FILE.tmp"
-        return 1
       fi
-    fi
-  fi
 
-  log "[配置更新] 错误：超过最大重试次数"
+      retry=$((retry + 1))
+      sleep "$CONFIG_RETRY_INTERVAL"
+    done
+
+    # 当前来源成功则直接返回
+    if [ $ok_any -eq 1 ]; then
+      return 0
+    fi
+
+    # 只有“整轮尝试主来源失败”才 +1（多次重试只算一次）
+    if [ "$label" = "主" ]; then
+      PRIMARY_FAIL_COUNT=$((PRIMARY_FAIL_COUNT + 1))
+      echo "$PRIMARY_FAIL_COUNT" > "$FAIL_COUNT_FILE"
+      log "[配置切换] 主配置下载失败，失败次数增加至 $PRIMARY_FAIL_COUNT"
+    fi
+  done
+
+  log "[配置更新] 主/备两个来源均下载失败"
   return 1
 }
 
@@ -202,7 +186,7 @@ start_socks() {
     return 0
   fi
   log "[SOCKS] 启动中..."
-  # 建议：danted 使用独立日志，避免污染 openvpn.log
+  # danted 独立日志，避免污染 openvpn.log（建议 danted.conf 使用 logoutput: stderr）
   /usr/sbin/danted -f /etc/danted.conf > /var/log/danted.log 2>&1 &
   CURRENT_SOCKS_PID=$!
   sleep 2
@@ -264,9 +248,7 @@ monitor_socks() {
   local initial_ip
   initial_ip=$(curl -sSf --connect-timeout 10 --max-time 15 --location --fail \
       --socks5-hostname 127.0.0.1:1080 "http://ping0.cc/geo" \
-      --http1.1 \
-      --tls-max 1.2 \
-      2>/dev/null | head -n 2)
+      --http1.1 --tls-max 1.2 2>/dev/null | head -n 2)
   if echo "$initial_ip" | head -n 1 | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; then
     log "[SOCKS监控] 初始IP获取成功: $(echo "$initial_ip" | head -n 1)"
     send_telegram_message "$initial_ip"
@@ -281,7 +263,7 @@ monitor_socks() {
   local total_checks=0
   local test_urls=("https://www.gstatic.com/generate_204" "https://www.wikipedia.org" "https://www.cloudflare.com")
   local url_index=0
-  log "[SOCKS监控] 开始对知名网站进行轮询联通性测试"
+  log "[SOCKS监控] 开始轮询连通性测试"
 
   while true; do
     if ! kill -0 "$VPN_PID" 2>/dev/null; then
@@ -293,7 +275,7 @@ monitor_socks() {
     url_index=$((total_checks % 3))
     local current_url=${test_urls[$url_index]}
 
-    log "[SOCKS检测] 测试#${total_checks} 代理连通性 (目标: $current_url)..."
+    log "[SOCKS检测] 测试#${total_checks} (目标: $current_url)..."
 
     if timeout 25s curl --silent --show-error --fail \
         --connect-timeout 10 --max-time 15 --location \
@@ -350,7 +332,7 @@ check_errors() {
   return 0
 }
 
-# 优雅退出：容器 stop/restart 时清掉子进程
+# ----- 优雅退出：容器 stop/restart 时清理子进程 -----
 graceful_exit() {
   log "[退出] 收尾：停止 SOCKS 和 OpenVPN"
   stop_socks
@@ -359,6 +341,7 @@ graceful_exit() {
 }
 trap graceful_exit SIGTERM SIGINT
 
+# ===== 启动流程 =====
 log "=== OpenVPN自动维护脚本启动 ==="
 log "主配置URL: $PRIMARY_CONFIG_URL"
 log "备用配置URL: $BACKUP_CONFIG_URL"
@@ -375,6 +358,7 @@ else
   log "[初始化] 启动失败"
 fi
 
+# ===== 维护循环 =====
 while true; do
   if ! $RECOVERY_LOCK && { ! check_errors || [ -z "$VPN_PID" ] || ! monitor_socks; }; then
     RECOVERY_LOCK=true
