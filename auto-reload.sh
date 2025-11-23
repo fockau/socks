@@ -29,6 +29,9 @@ MONITOR_SUCCESS_EVERY_N="${MONITOR_SUCCESS_EVERY_N:-0}"# 成功节流：>0 表�
 # danted 日志路径（用于恢复时一起清理）
 DANTED_LOG_FILE="${DANTED_LOG_FILE:-/var/log/danted.log}"
 
+# SOCKS 代理地址（nc 使用），默认容器内部的 danted
+SOCKS_PROXY_ADDR="${SOCKS_PROXY_ADDR:-127.0.0.1:1080}"
+
 # ===== 运行时变量 =====
 RECOVERY_LOCK=false
 CURRENT_SOCKS_PID=0
@@ -250,6 +253,35 @@ start_vpn() {
   fi
 }
 
+# ----- 纯 TCP socks 连通性检测（nc）-----
+check_socks_tcp() {
+  # 如果 nc 不存在，则直接认为检测通过，避免一直误报
+  if ! command -v nc >/dev/null 2>&1; then
+    log "[SOCKS检测] 警告: 未找到 nc 命令，跳过 TCP 握手检测（请在镜像中安装 netcat-openbsd）"
+    return 0
+  fi
+
+  local proxy_addr="$SOCKS_PROXY_ADDR"
+
+  # 非常稳定的几个公网 IP:443
+  local targets=("1.1.1.1 443" "8.8.8.8 443" "9.9.9.9 443")
+
+  local t host port
+  for t in "${targets[@]}"; do
+    set -- $t
+    host="$1"
+    port="$2"
+
+    # 通过 SOCKS5 做 TCP handshake（不发数据）
+    # -x socks代理地址，-X 5 socks5，-z 只探测，-w 超时
+    if nc -x "$proxy_addr" -X 5 -z -w 5 "$host" "$port" >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
 monitor_socks() {
   log "[SOCKS监控] 启动监控 (${SOCKS_CHECK_INTERVAL}秒间隔)"
   log "[SOCKS监控] 尝试获取初始IP..."
@@ -269,8 +301,6 @@ monitor_socks() {
   local max_fail_count=3
   local total_checks=0
   local success_count=0
-  local test_urls=("https://www.gstatic.com/generate_204" "https://www.wikipedia.org" "https://www.cloudflare.com")
-  local url_index=0
 
   while true; do
     if ! kill -0 "$VPN_PID" 2>/dev/null; then
@@ -279,32 +309,24 @@ monitor_socks() {
     fi
 
     total_checks=$((total_checks + 1))
-    url_index=$((total_checks % 3))
-    local current_url=${test_urls[$url_index]}
 
-    if timeout 25s curl --silent --show-error --fail \
-        --connect-timeout 10 --max-time 15 --location \
-        --socks5-hostname 127.0.0.1:1080 "$current_url" \
-        --head --http1.1 --tls-max 1.2 >/dev/null 2>&1; then
+    if check_socks_tcp; then
       socks_fail_count=0
       success_count=$((success_count + 1))
       if [ "$LOG_ONLY_ERRORS" != "true" ]; then
         if [ "$MONITOR_SUCCESS_EVERY_N" -gt 0 ]; then
           if [ $((success_count % MONITOR_SUCCESS_EVERY_N)) -eq 0 ]; then
-            log "[SOCKS检测] 连通性正常 - 目标: $current_url (累计OK: $success_count)"
+            log "[SOCKS检测] 连通性正常 (TCP handshake，通过 SOCKS) (累计OK: $success_count)"
           fi
         else
-          log "[SOCKS检测] 连通性正常 - 目标: $current_url"
+          log "[SOCKS检测] 连通性正常 (TCP handshake，通过 SOCKS)"
         fi
       fi
     else
       socks_fail_count=$((socks_fail_count + 1))
-      local curl_error
-      curl_error=$(timeout 25s curl -I -v --socks5-hostname 127.0.0.1:1080 "$current_url" \
-          --http1.1 --tls-max 1.2 2>&1 | grep -E 'Failed|error|SSL|timeout|HTTP/[12]\.[01] [45][0-9][0-9]' | tail -n 3 || true)
-      log "[SOCKS检测] 失败 (累计:${socks_fail_count}/${max_fail_count}) 目标: $current_url 错误: ${curl_error:-无详情}"
+      log "[SOCKS检测] 失败 (累计:${socks_fail_count}/${max_fail_count}) —— 通过 SOCKS 的 TCP 握手到公网 IP 均失败"
       if [ "$socks_fail_count" -ge "$max_fail_count" ]; then
-        log "[SOCKS监控] 达到失败阈值 (连续失败 $max_fail_count 次)"
+        log "[SOCKS监控] 达到失败阈值 (连续失败 $max_fail_count 次)，触发恢复流程"
         return 1
       fi
     fi
