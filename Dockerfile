@@ -6,6 +6,7 @@ RUN apt-get update -y && apt-get install -y \
     jq \
     procps \
     dante-server \
+    netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p /etc/openvpn/client /var/log && \
