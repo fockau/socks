@@ -10,21 +10,24 @@ CONFIG_FILE="${CONFIG_FILE:-/etc/openvpn/client/client.ovpn}"
 LOG_FILE="${LOG_FILE:-/var/log/openvpn.log}"
 
 CHECK_INTERVAL="${CHECK_INTERVAL:-10}"
-MAX_RETRIES="${MAX_RETRIES:-1}"             # 每个配置源最多尝试次数，按你要求默认 1 次失败就切换
+MAX_RETRIES="${MAX_RETRIES:-1}"                     # 每个配置源下载失败一次就切换
 CONFIG_RETRY_INTERVAL="${CONFIG_RETRY_INTERVAL:-5}"
 RECOVERY_DELAY="${RECOVERY_DELAY:-5}"
 LOG_MAX_SIZE_MB="${LOG_MAX_SIZE_MB:-10}"
+
+VPN_START_PER_TRY_WAIT="${VPN_START_PER_TRY_WAIT:-20}"           # 单次启动最长等待秒数
+MAX_VPN_FAIL_SECONDS_PER_CONFIG="${MAX_VPN_FAIL_SECONDS_PER_CONFIG:-300}"  # 每个配置累计启动失败时间上限（秒）
 
 TG_BOT_TOKEN="${TG_BOT_TOKEN:-}"
 TG_CHAT_ID="${TG_CHAT_ID:-}"
 INSTANCE_NAME="${INSTANCE_NAME:-VPN}"
 
-# SOCKS 检测相关（默认 10 秒，只记录失败）
-SOCKS_CHECK_INTERVAL="${SOCKS_CHECK_INTERVAL:-10}"
-LOG_ONLY_ERRORS="${LOG_ONLY_ERRORS:-true}"
-MONITOR_SUCCESS_EVERY_N="${MONITOR_SUCCESS_EVERY_N:-0}"  # >0: 每 N 次成功记一次日志，0=永不
+# SOCKS 检测相关
+SOCKS_CHECK_INTERVAL="${SOCKS_CHECK_INTERVAL:-10}"   # 检测间隔秒
+LOG_ONLY_ERRORS="${LOG_ONLY_ERRORS:-true}"          # 只在失败时记录检测日志
+MONITOR_SUCCESS_EVERY_N="${MONITOR_SUCCESS_EVERY_N:-0}" # >0 时每 N 次成功记录一次
 
-# danted 日志路径（用于恢复时一起清理）
+# danted 日志路径（用于恢复时一并清理）
 DANTED_LOG_FILE="${DANTED_LOG_FILE:-/var/log/danted.log}"
 
 # SOCKS 代理地址（nc 使用）
@@ -34,6 +37,15 @@ SOCKS_PROXY_ADDR="${SOCKS_PROXY_ADDR:-127.0.0.1:1080}"
 RECOVERY_LOCK=false
 CURRENT_SOCKS_PID=0
 VPN_PID=""
+
+# 每个配置累计“启动失败等待时间”（秒）
+PRIMARY_VPN_FAIL_SECONDS=0
+BACKUP_VPN_FAIL_SECONDS=0
+
+# 当前 CONFIG_FILE 对应的是主还是备（"主" / "备"）
+CURRENT_CONFIG_LABEL=""
+# choose_config_label() 输出的下一轮要用的配置
+NEXT_CONFIG_LABEL=""
 
 # ----- LOG ROTATION: copytruncate style -----
 check_log_size() {
@@ -66,6 +78,7 @@ clear_log() {
   log "[清理] OpenVPN 日志和 danted 日志已清空"
 }
 
+# ===== Telegram 发送：一次 + 最多两次重试，发 ping0.cc + cip.cc 完整信息 =====
 send_telegram_message() {
   local message="$1"
 
@@ -75,78 +88,174 @@ send_telegram_message() {
   fi
 
   local send_url="https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage"
-  local short_message
-  short_message=$(echo "$message" | head -n 2)
-
-  log "[Telegram] 尝试发送新消息..."
-
+  local max_attempts=3
+  local attempt=1
   local send_response
-  send_response=$(curl -s -X POST "$send_url" \
-      -d chat_id="$TG_CHAT_ID" \
-      -d text="${INSTANCE_NAME} 当前IP:%0A$short_message" \
-      --http1.1 --tls-max 1.2 --connect-timeout 5 --max-time 10 2>/dev/null)
-  local send_status=$?
+  local send_status
 
-  if [ $send_status -eq 0 ] && [ -n "$send_response" ]; then
-    log "[Telegram] 消息已成功发送"
-  else
-    log "[Telegram] 错误：消息发送失败 (状态码: $send_status, 响应: $send_response)"
-  fi
-}
+  # 把实例名加在最上面
+  local text="${INSTANCE_NAME} 当前IP信息如下："$'\n'"${message}"
 
-# ----- 配置下载：每次调用都固定“先主后备”，每个源失败一次就切换 -----
-download_config() {
-  local src label retry
+  while [ $attempt -le $max_attempts ]; do
+    log "[Telegram] 尝试发送消息 (第 ${attempt}/${max_attempts} 次)..."
 
-  # 固定顺序：主 -> 备
-  local sources=("$PRIMARY_CONFIG_URL" "$BACKUP_CONFIG_URL")
-  local labels=("主" "备")
+    send_response=$(curl -s -X POST "$send_url" \
+      -d "chat_id=${TG_CHAT_ID}" \
+      --data-urlencode "text=${text}" \
+      --http1.1 --tls-max 1.2 \
+      --connect-timeout 5 --max-time 10 2>/dev/null)
 
-  for i in 0 1; do
-    src="${sources[$i]}"
-    label="${labels[$i]}"
-    retry=0
+    send_status=$?
 
-    while [ $retry -lt "$MAX_RETRIES" ]; do
-      log "[配置更新] 尝试从${label}配置下载 (第 $((retry+1))/$MAX_RETRIES 次)"
+    if [ $send_status -eq 0 ] && echo "$send_response" | grep -q '"ok":true'; then
+      log "[Telegram] 消息已成功发送"
+      return 0
+    else
+      log "[Telegram] 错误：发送失败 (状态码: $send_status, 响应: $send_response)"
+    fi
 
-      if curl -sSf --connect-timeout 20 --max-time 30 "$src" -o "$CONFIG_FILE.tmp"; then
-        if grep -q "client" "$CONFIG_FILE.tmp" && \
-           grep -q "dev tun" "$CONFIG_FILE.tmp" && \
-           grep -q "remote " "$CONFIG_FILE.tmp"; then
-
-          # 修复 cipher 配置
-          sed -i '/^cipher AES-128-CBC$/d' "$CONFIG_FILE.tmp"
-          echo "data-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC" >> "$CONFIG_FILE.tmp"
-          echo "data-ciphers-fallback AES-128-CBC" >> "$CONFIG_FILE.tmp"
-
-          mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-          chmod 600 "$CONFIG_FILE"
-
-          log "[配置更新] 下载验证成功 (来源: ${label}配置: $src)"
-          return 0
-        else
-          log "[配置更新] 错误：${label}配置缺少必要字段"
-          rm -f "$CONFIG_FILE.tmp"
-        fi
-      else
-        log "[配置更新] 错误：从${label}配置下载失败"
-        rm -f "$CONFIG_FILE.tmp"
-      fi
-
-      retry=$((retry + 1))
-      if [ $retry -lt "$MAX_RETRIES" ]; then
-        sleep "$CONFIG_RETRY_INTERVAL"
-      fi
-    done
-
-    log "[配置更新] ${label}配置在本轮尝试中失败，将切换下一个来源"
+    attempt=$((attempt + 1))
+    if [ $attempt -le $max_attempts ]; then
+      sleep 2
+    fi
   done
 
-  log "[配置更新] 主/备两个来源均下载失败"
+  log "[Telegram] 多次重试后仍发送失败"
   return 1
 }
 
+# ===== 配置选择策略：根据每个配置累计启动失败时间切换 =====
+choose_config_label() {
+  if [ "$PRIMARY_VPN_FAIL_SECONDS" -lt "$MAX_VPN_FAIL_SECONDS_PER_CONFIG" ] && \
+     [ "$BACKUP_VPN_FAIL_SECONDS" -lt "$MAX_VPN_FAIL_SECONDS_PER_CONFIG" ]; then
+    NEXT_CONFIG_LABEL="主"
+    return 0
+  fi
+
+  if [ "$PRIMARY_VPN_FAIL_SECONDS" -ge "$MAX_VPN_FAIL_SECONDS_PER_CONFIG" ] && \
+     [ "$BACKUP_VPN_FAIL_SECONDS" -lt "$MAX_VPN_FAIL_SECONDS_PER_CONFIG" ]; then
+    log "[配置策略] 主配置累计启动失败时间已达阈值 (${PRIMARY_VPN_FAIL_SECONDS}s >= ${MAX_VPN_FAIL_SECONDS_PER_CONFIG}s)，优先使用备用配置"
+    NEXT_CONFIG_LABEL="备"
+    return 0
+  fi
+
+  if [ "$BACKUP_VPN_FAIL_SECONDS" -ge "$MAX_VPN_FAIL_SECONDS_PER_CONFIG" ] && \
+     [ "$PRIMARY_VPN_FAIL_SECONDS" -lt "$MAX_VPN_FAIL_SECONDS_PER_CONFIG" ]; then
+    log "[配置策略] 备用配置累计启动失败时间已达阈值 (${BACKUP_VPN_FAIL_SECONDS}s >= ${MAX_VPN_FAIL_SECONDS_PER_CONFIG}s)，优先使用主配置"
+    NEXT_CONFIG_LABEL="主"
+    return 0
+  fi
+
+  log "[配置策略] 主/备配置累计失败时间均超过阈值，仍优先尝试主配置"
+  NEXT_CONFIG_LABEL="主"
+}
+
+# ===== 下载指定来源的配置（主 or 备）=====
+download_config_for_source() {
+  local label="$1"
+  local src=""
+
+  if [ "$label" = "主" ]; then
+    src="$PRIMARY_CONFIG_URL"
+  else
+    src="$BACKUP_CONFIG_URL"
+  fi
+
+  local retry=0
+  while [ $retry -lt "$MAX_RETRIES" ]; do
+    log "[配置更新] 尝试从${label}配置下载 (第 $((retry+1))/$MAX_RETRIES 次)"
+
+    if curl -sSf --connect-timeout 20 --max-time 30 "$src" -o "$CONFIG_FILE.tmp"; then
+      if grep -q "client" "$CONFIG_FILE.tmp" && \
+         grep -q "dev tun" "$CONFIG_FILE.tmp" && \
+         grep -q "remote " "$CONFIG_FILE.tmp"; then
+
+        sed -i '/^cipher AES-128-CBC$/d' "$CONFIG_FILE.tmp"
+        echo "data-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC" >> "$CONFIG_FILE.tmp"
+        echo "data-ciphers-fallback AES-128-CBC" >> "$CONFIG_FILE.tmp"
+
+        mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+        chmod 600 "$CONFIG_FILE"
+
+        log "[配置更新] 下载验证成功 (来源: ${label}配置: $src)"
+        CURRENT_CONFIG_LABEL="$label"
+        return 0
+      else
+        log "[配置更新] 错误：${label}配置缺少必要字段"
+        rm -f "$CONFIG_FILE.tmp"
+      fi
+    else
+      log "[配置更新] 错误：从${label}配置下载失败"
+      rm -f "$CONFIG_FILE.tmp"
+    fi
+
+    retry=$((retry + 1))
+    if [ $retry -lt "$MAX_RETRIES" ]; then
+      sleep "$CONFIG_RETRY_INTERVAL"
+    fi
+  done
+
+  log "[配置更新] ${label}配置在本轮尝试中下载失败"
+  return 1
+}
+
+# ===== 高层 download_config：根据失败时间决定先主还是先备，下载失败就切另一边 =====
+download_config() {
+  choose_config_label
+
+  local first_label="$NEXT_CONFIG_LABEL"
+  local second_label
+  if [ "$first_label" = "主" ]; then
+    second_label="备"
+  else
+    second_label="主"
+  fi
+
+  if download_config_for_source "$first_label"; then
+    return 0
+  fi
+
+  log "[配置更新] ${first_label}配置本轮下载失败，尝试${second_label}配置"
+
+  if download_config_for_source "$second_label"; then
+    return 0
+  fi
+
+  log "[配置更新] 主/备两个配置源本轮下载均失败"
+  return 1
+}
+
+# ===== VPN 启动失败时间统计 =====
+update_vpn_fail_time() {
+  local elapsed="$1"
+  local result="$2"  # "success" 或 "fail"
+
+  case "$CURRENT_CONFIG_LABEL" in
+    "主")
+      if [ "$result" = "success" ]; then
+        PRIMARY_VPN_FAIL_SECONDS=0
+        log "[配置统计] 主配置启动成功，累计失败时间重置为 0 秒"
+      else
+        PRIMARY_VPN_FAIL_SECONDS=$((PRIMARY_VPN_FAIL_SECONDS + elapsed))
+        log "[配置统计] 主配置累计启动失败时间: ${PRIMARY_VPN_FAIL_SECONDS} 秒"
+      fi
+      ;;
+    "备")
+      if [ "$result" = "success" ]; then
+        BACKUP_VPN_FAIL_SECONDS=0
+        log "[配置统计] 备用配置启动成功，累计失败时间重置为 0 秒"
+      else
+        BACKUP_VPN_FAIL_SECONDS=$((BACKUP_VPN_FAIL_SECONDS + elapsed))
+        log "[配置统计] 备用配置累计启动失败时间: ${BACKUP_VPN_FAIL_SECONDS} 秒"
+      fi
+      ;;
+    *)
+      log "[配置统计] 警告: CURRENT_CONFIG_LABEL 未设置，无法统计失败时间"
+      ;;
+  esac
+}
+
+# ===== SOCKS 相关 =====
 stop_socks() {
   if [ "$CURRENT_SOCKS_PID" -ne 0 ]; then
     if kill -0 "$CURRENT_SOCKS_PID" 2>/dev/null; then
@@ -171,7 +280,6 @@ start_socks() {
   fi
 
   log "[SOCKS] 启动中..."
-  # 建议 danted.conf 使用 logoutput: stderr，这里才能完整收集
   /usr/sbin/danted -f /etc/danted.conf > "$DANTED_LOG_FILE" 2>&1 &
   CURRENT_SOCKS_PID=$!
 
@@ -187,6 +295,7 @@ start_socks() {
   fi
 }
 
+# ===== VPN 相关 =====
 stop_vpn() {
   if [ -n "$VPN_PID" ] && kill -0 "$VPN_PID" 2>/dev/null; then
     kill "$VPN_PID"
@@ -201,34 +310,52 @@ stop_vpn() {
 
 start_vpn() {
   stop_vpn
-  log "[VPN] 启动中..."
+  log "[VPN] 启动中 (配置: ${CURRENT_CONFIG_LABEL:-未知})..."
+
   if openvpn --config "$CONFIG_FILE" >> "$LOG_FILE" 2>&1 & then
     VPN_PID=$!
     local wait_time=0
-    local max_wait=20
-    while [ $wait_time -lt $max_wait ]; do
+    local max_wait="$VPN_START_PER_TRY_WAIT"
+    local start_ts
+    local end_ts
+    local elapsed
+
+    start_ts=$(date +%s)
+
+    while [ $wait_time -lt "$max_wait" ]; do
       if ! kill -0 "$VPN_PID" 2>/dev/null; then
-        log "[VPN] 进程意外退出"
+        log "[VPN] 进程在启动过程中意外退出"
+        end_ts=$(date +%s)
+        elapsed=$((end_ts - start_ts))
+        update_vpn_fail_time "$elapsed" "fail"
         return 1
       fi
-      if tail -n 20 "$LOG_FILE" | grep -q "Initialization Sequence Completed"; then
-        log "[VPN] 启动成功 (PID: $VPN_PID)"
+
+      if tail -n 50 "$LOG_FILE" | grep -q "Initialization Sequence Completed"; then
+        log "[VPN] 启动成功 (PID: $VPN_PID, 配置: ${CURRENT_CONFIG_LABEL:-未知})"
+        update_vpn_fail_time 0 "success"
         sleep "$RECOVERY_DELAY"
         return 0
       fi
+
       sleep 1
       wait_time=$((wait_time + 1))
     done
-    log "[VPN] 启动超时"
+
+    log "[VPN] 启动超时（${max_wait} 秒内未完成初始化）"
     kill "$VPN_PID" 2>/dev/null || true
+    end_ts=$(date +%s)
+    elapsed=$((end_ts - start_ts))
+    update_vpn_fail_time "$elapsed" "fail"
     return 1
   else
-    log "[VPN] 启动失败"
+    log "[VPN] 启动失败（openvpn 无法启动）"
+    update_vpn_fail_time 0 "fail"
     return 1
   fi
 }
 
-# ----- 纯 TCP socks 连通性检测（nc）-----
+# ===== SOCKS 纯 TCP 连通性检测（nc）=====
 check_socks_tcp() {
   if ! command -v nc >/dev/null 2>&1; then
     log "[SOCKS检测] 警告: 未找到 nc 命令，跳过 TCP 握手检测（请在镜像中安装 netcat-openbsd）"
@@ -243,7 +370,6 @@ check_socks_tcp() {
     set -- $t
     host="$1"
     port="$2"
-
     if nc -x "$proxy_addr" -X 5 -z -w 5 "$host" "$port" >/dev/null 2>&1; then
       return 0
     fi
@@ -256,18 +382,28 @@ monitor_socks() {
   log "[SOCKS监控] 启动监控 (${SOCKS_CHECK_INTERVAL}秒间隔)"
   log "[SOCKS监控] 尝试获取初始IP..."
 
-  local initial_ip
-  initial_ip=$(curl -sSf --connect-timeout 10 --max-time 15 --location --fail \
-      --socks5-hostname 127.0.0.1:1080 "http://ping0.cc/geo" \
-      --http1.1 --tls-max 1.2 2>/dev/null | head -n 2)
+  local ping0_info cip_info combined
 
-  if echo "$initial_ip" | head -n 1 | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+'; then
-    log "[SOCKS监控] 初始IP获取成功: $(echo "$initial_ip" | head -n 1)"
-    send_telegram_message "$initial_ip"
+  # 通过 SOCKS 请求 ping0.cc/geo 完整信息
+  ping0_info=$(curl -sSf --connect-timeout 10 --max-time 15 --location --fail \
+      --socks5-hostname 127.0.0.1:1080 "http://ping0.cc/geo" \
+      --http1.1 --tls-max 1.2 2>/dev/null || true)
+
+  # 通过 SOCKS 请求 cip.cc 完整信息
+  cip_info=$(curl -sSf --connect-timeout 10 --max-time 15 --location --fail \
+      --socks5-hostname 127.0.0.1:1080 "http://cip.cc" \
+      --http1.1 --tls-max 1.2 2>/dev/null || true)
+
+  if echo "$ping0_info" | grep -Eq '([0-9]{1,3}\.){3}[0-9]{1,3}'; then
+    log "[SOCKS监控] 初始IP获取成功 (来自 ping0.cc): $(echo "$ping0_info" | head -n 1)"
   else
-    log "[SOCKS监控] 初始IP获取失败"
-    log "[SOCKS监控] 返回内容: $initial_ip"
+    log "[SOCKS监控] 初始IP获取失败或格式异常"
+    log "[SOCKS监控] ping0.cc 返回内容: $ping0_info"
   fi
+
+  combined="${ping0_info}"$'\n\n'"${cip_info}"
+
+  send_telegram_message "$combined"
 
   local socks_fail_count=0
   local max_fail_count=3
@@ -358,6 +494,8 @@ log "备用配置URL: $BACKUP_CONFIG_URL"
 log "检测间隔: $CHECK_INTERVAL 秒"
 log "日志轮转阈值: ${LOG_MAX_SIZE_MB} MB"
 log "SOCKS 检测间隔: ${SOCKS_CHECK_INTERVAL} 秒，LOG_ONLY_ERRORS=${LOG_ONLY_ERRORS}"
+log "单次 VPN 启动最大等待: ${VPN_START_PER_TRY_WAIT} 秒"
+log "每个配置累计启动失败时间上限: ${MAX_VPN_FAIL_SECONDS_PER_CONFIG} 秒"
 
 while ! download_config; do
   sleep "$CONFIG_RETRY_INTERVAL"
@@ -380,7 +518,7 @@ while true; do
     stop_vpn
     log "[恢复] 步骤3/6: 清理日志文件..."
     clear_log
-    log "[恢复] 步骤4/6: 下载配置..."
+    log "[恢复] 步骤4/6: 选择并下载配置..."
     if download_config; then
       log "[恢复] 步骤5/6: 启动OpenVPN..."
       if start_vpn; then
