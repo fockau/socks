@@ -14,7 +14,6 @@ MAX_RETRIES="${MAX_RETRIES:-1}"             # 每个配置源最多尝试次数�
 CONFIG_RETRY_INTERVAL="${CONFIG_RETRY_INTERVAL:-5}"
 RECOVERY_DELAY="${RECOVERY_DELAY:-5}"
 LOG_MAX_SIZE_MB="${LOG_MAX_SIZE_MB:-10}"
-VPN_START_MAX_WAIT="${VPN_START_MAX_WAIT:-300}" # VPN 启动最长等待时间（秒），默认 5 分钟
 
 TG_BOT_TOKEN="${TG_BOT_TOKEN:-}"
 TG_CHAT_ID="${TG_CHAT_ID:-}"
@@ -95,52 +94,56 @@ send_telegram_message() {
   fi
 }
 
-# ----- 配置下载：按指定来源（主/备）尝试，失败最多 MAX_RETRIES 次 -----
-download_config_for_source() {
-  local label="$1"
-  local src=""
+# ----- 配置下载：每次调用都固定“先主后备”，每个源失败一次就切换 -----
+download_config() {
+  local src label retry
 
-  if [ "$label" = "主" ]; then
-    src="$PRIMARY_CONFIG_URL"
-  else
-    src="$BACKUP_CONFIG_URL"
-  fi
+  # 固定顺序：主 -> 备
+  local sources=("$PRIMARY_CONFIG_URL" "$BACKUP_CONFIG_URL")
+  local labels=("主" "备")
 
-  local retry=0
-  while [ $retry -lt "$MAX_RETRIES" ]; do
-    log "[配置更新] 尝试从${label}配置下载 (第 $((retry+1))/$MAX_RETRIES 次)"
+  for i in 0 1; do
+    src="${sources[$i]}"
+    label="${labels[$i]}"
+    retry=0
 
-    if curl -sSf --connect-timeout 20 --max-time 30 "$src" -o "$CONFIG_FILE.tmp"; then
-      if grep -q "client" "$CONFIG_FILE.tmp" && \
-         grep -q "dev tun" "$CONFIG_FILE.tmp" && \
-         grep -q "remote " "$CONFIG_FILE.tmp"; then
+    while [ $retry -lt "$MAX_RETRIES" ]; do
+      log "[配置更新] 尝试从${label}配置下载 (第 $((retry+1))/$MAX_RETRIES 次)"
 
-        # 修复 cipher 配置
-        sed -i '/^cipher AES-128-CBC$/d' "$CONFIG_FILE.tmp"
-        echo "data-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC" >> "$CONFIG_FILE.tmp"
-        echo "data-ciphers-fallback AES-128-CBC" >> "$CONFIG_FILE.tmp"
+      if curl -sSf --connect-timeout 20 --max-time 30 "$src" -o "$CONFIG_FILE.tmp"; then
+        if grep -q "client" "$CONFIG_FILE.tmp" && \
+           grep -q "dev tun" "$CONFIG_FILE.tmp" && \
+           grep -q "remote " "$CONFIG_FILE.tmp"; then
 
-        mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-        chmod 600 "$CONFIG_FILE"
+          # 修复 cipher 配置
+          sed -i '/^cipher AES-128-CBC$/d' "$CONFIG_FILE.tmp"
+          echo "data-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC" >> "$CONFIG_FILE.tmp"
+          echo "data-ciphers-fallback AES-128-CBC" >> "$CONFIG_FILE.tmp"
 
-        log "[配置更新] 下载验证成功 (来源: ${label}配置: $src)"
-        return 0
+          mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+          chmod 600 "$CONFIG_FILE"
+
+          log "[配置更新] 下载验证成功 (来源: ${label}配置: $src)"
+          return 0
+        else
+          log "[配置更新] 错误：${label}配置缺少必要字段"
+          rm -f "$CONFIG_FILE.tmp"
+        fi
       else
-        log "[配置更新] 错误：${label}配置缺少必要字段"
+        log "[配置更新] 错误：从${label}配置下载失败"
         rm -f "$CONFIG_FILE.tmp"
       fi
-    else
-      log "[配置更新] 错误：从${label}配置下载失败"
-      rm -f "$CONFIG_FILE.tmp"
-    fi
 
-    retry=$((retry + 1))
-    if [ $retry -lt "$MAX_RETRIES" ]; then
-      sleep "$CONFIG_RETRY_INTERVAL"
-    fi
+      retry=$((retry + 1))
+      if [ $retry -lt "$MAX_RETRIES" ]; then
+        sleep "$CONFIG_RETRY_INTERVAL"
+      fi
+    done
+
+    log "[配置更新] ${label}配置在本轮尝试中失败，将切换下一个来源"
   done
 
-  log "[配置更新] ${label}配置在本轮尝试中失败"
+  log "[配置更新] 主/备两个来源均下载失败"
   return 1
 }
 
@@ -168,6 +171,7 @@ start_socks() {
   fi
 
   log "[SOCKS] 启动中..."
+  # 建议 danted.conf 使用 logoutput: stderr，这里才能完整收集
   /usr/sbin/danted -f /etc/danted.conf > "$DANTED_LOG_FILE" 2>&1 &
   CURRENT_SOCKS_PID=$!
 
@@ -201,13 +205,13 @@ start_vpn() {
   if openvpn --config "$CONFIG_FILE" >> "$LOG_FILE" 2>&1 & then
     VPN_PID=$!
     local wait_time=0
-    local max_wait="$VPN_START_MAX_WAIT"
-    while [ $wait_time -lt "$max_wait" ]; do
+    local max_wait=20
+    while [ $wait_time -lt $max_wait ]; do
       if ! kill -0 "$VPN_PID" 2>/dev/null; then
-        log "[VPN] 进程在启动过程中意外退出"
+        log "[VPN] 进程意外退出"
         return 1
       fi
-      if tail -n 50 "$LOG_FILE" | grep -q "Initialization Sequence Completed"; then
+      if tail -n 20 "$LOG_FILE" | grep -q "Initialization Sequence Completed"; then
         log "[VPN] 启动成功 (PID: $VPN_PID)"
         sleep "$RECOVERY_DELAY"
         return 0
@@ -215,45 +219,13 @@ start_vpn() {
       sleep 1
       wait_time=$((wait_time + 1))
     done
-    log "[VPN] 启动超时 (${max_wait} 秒内未完成初始化)"
+    log "[VPN] 启动超时"
     kill "$VPN_PID" 2>/dev/null || true
     return 1
   else
-    log "[VPN] 启动失败（openvpn 无法启动）"
+    log "[VPN] 启动失败"
     return 1
   fi
-}
-
-# ----- 整体 VPN 配置 + 启动流程：先主后备，每个配置若 5 分钟内 VPN 启动失败，就换下一个 -----
-setup_vpn_cycle() {
-  log "[配置流程] 本轮开始：先尝试主配置，再尝试备用配置；每个配置最多尝试 ${MAX_RETRIES} 次下载，VPN 启动等待最多 ${VPN_START_MAX_WAIT} 秒"
-
-  # 1. 先试主配置
-  if download_config_for_source "主"; then
-    if start_vpn; then
-      log "[配置流程] 使用主配置启动 VPN 成功"
-      return 0
-    else
-      log "[配置流程] 使用主配置启动 VPN 失败，将尝试备用配置"
-    fi
-  else
-    log "[配置流程] 主配置下载失败，将尝试备用配置"
-  fi
-
-  # 2. 再试备用配置
-  if download_config_for_source "备"; then
-    if start_vpn; then
-      log "[配置流程] 使用备用配置启动 VPN 成功"
-      return 0
-    else
-      log "[配置流程] 使用备用配置启动 VPN 失败"
-    fi
-  else
-    log "[配置流程] 备用配置下载失败"
-  fi
-
-  log "[配置流程] 本轮主/备配置均无法正常启动 VPN"
-  return 1
 }
 
 # ----- 纯 TCP socks 连通性检测（nc）-----
@@ -386,18 +358,15 @@ log "备用配置URL: $BACKUP_CONFIG_URL"
 log "检测间隔: $CHECK_INTERVAL 秒"
 log "日志轮转阈值: ${LOG_MAX_SIZE_MB} MB"
 log "SOCKS 检测间隔: ${SOCKS_CHECK_INTERVAL} 秒，LOG_ONLY_ERRORS=${LOG_ONLY_ERRORS}"
-log "VPN 启动最长等待时间: ${VPN_START_MAX_WAIT} 秒"
 
-# 初始配置+VPN启动（内含：主 -> 备 切换逻辑）
-while ! setup_vpn_cycle; do
+while ! download_config; do
   sleep "$CONFIG_RETRY_INTERVAL"
 done
 
-# VPN 已经起来了，再启动 SOCKS
-if start_socks; then
+if start_vpn && start_socks; then
   log "[初始化] 服务启动成功"
 else
-  log "[初始化] SOCKS 启动失败"
+  log "[初始化] 启动失败"
 fi
 
 # ===== 维护循环 =====
@@ -405,21 +374,27 @@ while true; do
   if ! $RECOVERY_LOCK && { ! check_errors || [ -z "$VPN_PID" ] || ! monitor_socks; }; then
     RECOVERY_LOCK=true
     log "[恢复] ====== 开始恢复流程 ======"
-    log "[恢复] 步骤1/4: 停止SOCKS代理..."
+    log "[恢复] 步骤1/6: 停止SOCKS代理..."
     stop_socks
-    log "[恢复] 步骤2/4: 停止OpenVPN..."
+    log "[恢复] 步骤2/6: 停止OpenVPN..."
     stop_vpn
-    log "[恢复] 步骤3/4: 清理日志文件..."
+    log "[恢复] 步骤3/6: 清理日志文件..."
     clear_log
-    log "[恢复] 步骤4/4: 重新配置并启动VPN..."
-    if setup_vpn_cycle; then
-      if start_socks; then
-        log "[恢复] 恢复成功"
+    log "[恢复] 步骤4/6: 下载配置..."
+    if download_config; then
+      log "[恢复] 步骤5/6: 启动OpenVPN..."
+      if start_vpn; then
+        log "[恢复] 步骤6/6: 启动SOCKS代理..."
+        if start_socks; then
+          log "[恢复] 恢复成功"
+        else
+          log "[恢复] SOCKS启动失败"
+        fi
       else
-        log "[恢复] SOCKS启动失败"
+        log "[恢复] OpenVPN启动失败"
       fi
     else
-      log "[恢复] 配置流程失败，无法启动VPN"
+      log "[恢复] 配置下载失败"
     fi
     RECOVERY_LOCK=false
     log "[恢复] ====== 恢复流程结束 ======"
